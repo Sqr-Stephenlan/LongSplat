@@ -7,6 +7,7 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 
+import json
 import os
 import numpy as np
 
@@ -52,6 +53,38 @@ try:
 except:
     FUSED_SSIM_AVAILABLE = False
     print("fused ssim not available")
+
+
+def _emit_loss_telemetry(stage, iteration, loss, components):
+    """Emit sparse, read-only loss diagnostics without changing optimization."""
+    if iteration != 0 and iteration != 1 and iteration % 1000 != 0:
+        return
+
+    def scalar_or_none(value):
+        if value is None:
+            return None
+        tensor = value.detach() if torch.is_tensor(value) else torch.as_tensor(value)
+        finite = torch.isfinite(tensor).all().item()
+        if not finite:
+            return None
+        return float(tensor.mean().item())
+
+    finite = bool(torch.isfinite(loss.detach()).all().item())
+    values = {name: scalar_or_none(value) for name, value in components.items()}
+    finite = finite and all(
+        value is None or np.isfinite(value) for value in values.values()
+    )
+    payload = {
+        "stage": str(stage),
+        "iteration": int(iteration),
+        "finite": bool(finite),
+        "total": scalar_or_none(loss),
+        **values,
+    }
+    print(
+        "LOSS_TELEMETRY " + json.dumps(payload, sort_keys=True, allow_nan=False),
+        flush=True,
+    )
     
 def reprojection_error(params, points_3d, points_2d, K):
     # Extract rotation and translation from params
@@ -66,11 +99,154 @@ def reprojection_error(params, points_3d, points_2d, K):
     return residuals.flatten()
 
 
+def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from, logger, tb_writer, gaussians, scene):
+    """Fixed-pose RGB-only training for the isolated external-camera route."""
+
+    cameras = scene.getTrainCameras()
+    if not cameras or not all(camera.is_registered for camera in cameras):
+        raise RuntimeError("external COLMAP route requires all training cameras registered")
+    if any(camera.depth_map is not None for camera in cameras):
+        raise RuntimeError("external COLMAP route must disable external/Mast3R depth")
+
+    iterations = int(opt.iterations)
+    if iterations <= 0:
+        raise ValueError(f"external COLMAP route requires positive iterations, got {iterations}")
+    opt.update_until = iterations
+    gaussians.training_setup(opt)
+
+    contract = dict(getattr(scene, "external_colmap_contract", {}))
+    contract.update({
+        "external_colmap_pose": True,
+        "mast3r_global_align_skipped": True,
+        "pose_frozen": True,
+        "vda_external_depth_disabled": True,
+        "depth_source": "disabled",
+        "training_mode": "fixed_pose_rgb_only",
+        "requested_rotation_lr_init": float(opt.rotation_lr_init),
+        "requested_translation_lr_init": float(opt.translation_lr_init),
+        "iterations": iterations,
+    })
+    print(
+        "EXTERNAL_POSE_TRAINING "
+        + json.dumps(contract, sort_keys=True, allow_nan=False),
+        flush=True,
+    )
+
+    viewpoint_stack = None
+    ema_loss_for_log = 0.0
+    progress_bar = tqdm(range(1, iterations + 1), desc="External COLMAP fixed-pose RGB")
+    for iteration in range(1, iterations + 1):
+        gaussians.update_learning_rate(iteration)
+        if not viewpoint_stack:
+            viewpoint_stack = list(cameras)
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+
+        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        if (iteration - 1) == debug_from:
+            pipe.debug = True
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, retain_grad=True)
+        image = render_pkg["render"]
+        viewspace_point_tensor = render_pkg["viewspace_points"]
+        visibility_filter = render_pkg["visibility_filter"]
+        offset_selection_mask = render_pkg["selection_mask"]
+        voxel_visible_mask = render_pkg["visible_mask"]
+        scaling = render_pkg["scaling"]
+        opacity = render_pkg["neural_opacity"]
+
+        gt_image = viewpoint_cam.original_image.cuda()
+        Ll1 = l1_loss(image, gt_image)
+        if FUSED_SSIM_AVAILABLE:
+            ssim_loss = 1 - fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        else:
+            ssim_loss = 1 - ssim(image, gt_image)
+        scaling_reg = scaling.prod(dim=1).mean()
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01 * scaling_reg
+        _emit_loss_telemetry(
+            "external_colmap_pose",
+            iteration,
+            loss,
+            {"l1": Ll1, "ssim": ssim_loss, "scaling": scaling_reg},
+        )
+        if not torch.isfinite(loss).all():
+            raise RuntimeError(f"external COLMAP route produced non-finite loss at iteration {iteration}")
+        loss.backward()
+
+        with torch.no_grad():
+            if iteration % 10 == 0:
+                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.7f}"})
+            if iteration < opt.update_until and iteration > opt.start_stat:
+                gaussians.training_statis(
+                    viewspace_point_tensor,
+                    opacity,
+                    visibility_filter,
+                    offset_selection_mask,
+                    voxel_visible_mask,
+                )
+                if iteration > opt.update_from and iteration % opt.update_interval == 0:
+                    gaussians.adjust_anchor(
+                        check_interval=opt.update_interval,
+                        success_threshold=opt.success_threshold,
+                        grad_threshold=opt.densify_grad_threshold,
+                        min_opacity=opt.min_opacity,
+                        require_purning=False,
+                    )
+            if iteration == opt.update_until:
+                del gaussians.opacity_accum
+                del gaussians.offset_gradient_accum
+                del gaussians.offset_denom
+                torch.cuda.empty_cache()
+            if iteration < iterations:
+                gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none=True)
+        progress_bar.update(1)
+    progress_bar.close()
+
+    checkpoint_iteration = iterations
+    scene.save(checkpoint_iteration)
+    save_transforms(scene.getTrainCameras().copy(), os.path.join(scene.model_path, "cameras_all_train.json"))
+    save_transforms(scene.getTestCameras().copy(), os.path.join(scene.model_path, "cameras_all_test.json"))
+    contract.update({
+        "checkpoint_iteration": checkpoint_iteration,
+        "checkpoint_ply": os.path.join(
+            scene.model_path,
+            "point_cloud",
+            f"iteration_{checkpoint_iteration}",
+            "point_cloud.ply",
+        ),
+        "active_camera_json": os.path.join(scene.model_path, "cameras_all_train.json"),
+    })
+    contract_path = os.path.join(scene.model_path, "external_colmap_pose_contract.json")
+    with open(contract_path, "w", encoding="utf-8") as handle:
+        json.dump(contract, handle, indent=2)
+        handle.write("\n")
+    if logger is not None:
+        logger.info("External COLMAP fixed-pose training saved iteration %s", checkpoint_iteration)
+    print(
+        "EXTERNAL_POSE_TRAINING_COMPLETE "
+        + json.dumps(contract, sort_keys=True, allow_nan=False),
+        flush=True,
+    )
+
+
 def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
     scene = Scene(dataset, gaussians)
+    if getattr(dataset, "external_colmap_pose", False):
+        return _training_external_colmap_pose(
+            dataset,
+            opt,
+            pipe,
+            dataset_name,
+            debug_from,
+            logger,
+            tb_writer,
+            gaussians,
+            scene,
+        )
     num_views = len(scene.getTrainCameras())
     start_view_id = 0
     end_view_id = 1

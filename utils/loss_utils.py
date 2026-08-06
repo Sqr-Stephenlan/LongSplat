@@ -10,13 +10,20 @@
 import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
-from math import exp
+from math import exp, log
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
 
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
+
+
+def anisotropy_regularization(scaling, *, soft_limit=30.0):
+    """Penalize needle-like converted Gaussians in linear scale space."""
+    safe = scaling.clamp_min(1e-8)
+    log_ratio = torch.log(safe.amax(dim=1)) - torch.log(safe.amin(dim=1))
+    return torch.relu(log_ratio - log(float(soft_limit))).square().mean()
 
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])

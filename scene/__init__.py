@@ -7,6 +7,7 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 
+import json
 import os
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
@@ -17,6 +18,7 @@ import torch
 from utils.mast3r_utils import Mast3rMatcher
 from scene.gaussian_model import BasicPointCloud
 from torch.nn import functional as F
+from utils.external_colmap_pose import external_camera_contract
 
 class Scene:
 
@@ -84,6 +86,10 @@ class Scene:
                     cam.update_RT(cam.R_pred, cam.T_pred)
                 cam.to_final()
         else:
+            if getattr(args, "external_colmap_pose", False):
+                self._initialize_external_colmap_scene(scene_info, args)
+                return
+
             self.init_frame_num = args.init_frame_num
             matcher = Mast3rMatcher()
             source_path = os.path.join(args.source_path, args.images)
@@ -152,6 +158,60 @@ class Scene:
             self.cameras_extent = 10.0
             print(f'self.cameras_extent: {self.cameras_extent}')
             self.gaussians.create_from_pcd(BasicPointCloud(points=pts3d, colors=None, normals=None), self.cameras_extent)
+
+    def _initialize_external_colmap_scene(self, scene_info, args):
+        """Initialize one isolated fixed-pose COLMAP route; default is off."""
+
+        if not getattr(args, "disable_resize", False):
+            raise ValueError("external_colmap_pose requires --disable_resize for the 1280x720 contract")
+        if getattr(args, "depth_source", "disabled") != "disabled":
+            raise ValueError("external_colmap_pose requires --depth_source disabled")
+        cameras = self.getAllCameras()
+        expected_names = [f"frame_{index:06d}" for index in range(len(cameras))]
+        contract = external_camera_contract(
+            scene_info.train_cameras + scene_info.test_cameras,
+            expected_names=expected_names,
+        )
+        if scene_info.point_cloud is None:
+            raise ValueError("external_colmap_pose requires COLMAP sparse points")
+
+        for camera in cameras:
+            if camera.R_gt is None or camera.T_gt is None:
+                raise ValueError(f"missing COLMAP pose for {camera.image_name}")
+            camera.update_RT(
+                camera.R_gt.to(device=camera.data_device, dtype=torch.float32),
+                camera.T_gt.to(device=camera.data_device, dtype=torch.float32),
+            )
+            camera.cam_rot_delta.requires_grad_(False)
+            camera.cam_trans_delta.requires_grad_(False)
+            camera.depth_map = None
+            camera.pre_depth_map = None
+            camera.kp0 = None
+            camera.kp1 = None
+            camera.conf = None
+            camera.is_registered = True
+
+        self.init_frame_num = len(cameras)
+        self.external_colmap_contract = {
+            **contract,
+            "external_colmap_pose": True,
+            "mast3r_global_align_skipped": True,
+            "pose_frozen": True,
+            "vda_external_depth_disabled": True,
+            "active_image_width": cameras[0].image_width,
+            "active_image_height": cameras[0].image_height,
+            "active_focal_x_px": float(cameras[0].Focalx),
+            "active_focal_y_px": float(cameras[0].Focaly),
+            "depth_source": "disabled",
+        }
+        print(
+            "EXTERNAL_POSE_CONTRACT "
+            + json.dumps(self.external_colmap_contract, sort_keys=True, allow_nan=False),
+            flush=True,
+        )
+        self.cameras_extent = 10.0
+        print(f"self.cameras_extent: {self.cameras_extent}")
+        self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
 
     def save(self, iteration):

@@ -6,6 +6,7 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+import json
 import torch
 from functools import reduce
 import numpy as np
@@ -497,8 +498,44 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_max(distCUDA2(fused_point_cloud), self.voxel_size)
+        dist2_raw = distCUDA2(fused_point_cloud)
+        dist2 = torch.clamp(dist2_raw, min=1e-7, max=self.voxel_size)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+
+        raw_finite = dist2_raw.detach()[torch.isfinite(dist2_raw.detach())]
+        adjusted_finite = dist2.detach()[torch.isfinite(dist2.detach())]
+        conversion_stats = {
+            "point_count": int(fused_point_cloud.shape[0]),
+            "nonpositive_distance_count": int(
+                ((dist2_raw <= 0) & torch.isfinite(dist2_raw)).sum().item()
+            ),
+            "finite_scale_count": int(
+                torch.isfinite(scales).all(dim=1).sum().item()
+            ),
+            "distance_min_before": (
+                float(raw_finite.min().item()) if raw_finite.numel() else None
+            ),
+            "distance_max_before": (
+                float(raw_finite.max().item()) if raw_finite.numel() else None
+            ),
+            "distance_min_after": (
+                float(adjusted_finite.min().item())
+                if adjusted_finite.numel()
+                else None
+            ),
+            "distance_max_after": (
+                float(adjusted_finite.max().item())
+                if adjusted_finite.numel()
+                else None
+            ),
+        }
+        print(
+            "CONVERSION_TELEMETRY "
+            + json.dumps(conversion_stats, sort_keys=True, allow_nan=False),
+            flush=True,
+        )
+        if not torch.isfinite(scales).all():
+            raise RuntimeError("3DGS conversion produced non-finite initial scales")
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
@@ -525,8 +562,8 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
-
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -623,7 +660,16 @@ class GaussianModel:
         offset = self._offset.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
-        rotation = self._rotation.detach().cpu().numpy()
+        rot_tensor = self._rotation.detach()
+        rot_norm = torch.linalg.vector_norm(rot_tensor, dim=1, keepdim=True)
+        identity = torch.zeros_like(rot_tensor)
+        identity[:, 0] = 1.0
+        rot_tensor = torch.where(
+            rot_norm > 1e-8,
+            rot_tensor / rot_norm.clamp_min(1e-8),
+            identity,
+        )
+        rotation = rot_tensor.cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
@@ -642,7 +688,16 @@ class GaussianModel:
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
-        rotation = self._rotation.detach().cpu().numpy()
+        rot_tensor = self._rotation.detach()
+        rot_norm = torch.linalg.vector_norm(rot_tensor, dim=1, keepdim=True)
+        identity = torch.zeros_like(rot_tensor)
+        identity[:, 0] = 1.0
+        rot_tensor = torch.where(
+            rot_norm > 1e-8,
+            rot_tensor / rot_norm.clamp_min(1e-8),
+            identity,
+        )
+        rotation = rot_tensor.cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes_3dgs()]
 

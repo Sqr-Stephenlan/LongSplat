@@ -7,6 +7,7 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import os
+import random
 import torch
 import numpy as np
 import subprocess
@@ -22,7 +23,7 @@ from tqdm import tqdm
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
 from gaussian_renderer import GaussianModel
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ssim, anisotropy_regularization
 from random import randint
 from utils.image_utils import psnr
 try:
@@ -30,6 +31,7 @@ try:
     FUSED_SSIM_AVAILABLE = True
 except:
     FUSED_SSIM_AVAILABLE = False
+
 
 def render_sets(dataset : ModelParams, opt : OptimizationParams, iteration : int, pipe : PipelineParams, pruning_ratio : float = 0.6):
     """
@@ -113,8 +115,23 @@ def render_sets(dataset : ModelParams, opt : OptimizationParams, iteration : int
             ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        scaling_reg = gaussians.get_scaling.prod(dim=1).mean()
-        loss += scaling_reg * 0.01
+        scaling = gaussians.get_scaling
+        scaling_reg = scaling.prod(dim=1).mean()
+        shape_reg = anisotropy_regularization(
+            scaling,
+            soft_limit=opt.anisotropy_soft_limit,
+        )
+        loss += scaling_reg * 0.01 + shape_reg * opt.anisotropy_reg_weight
+
+        if iteration % 1000 == 0:
+            print(
+                "CONVERSION_SHAPE_TELEMETRY "
+                f"iteration={iteration} "
+                f"anisotropy_loss={shape_reg.detach().item():.8g} "
+                f"weight={opt.anisotropy_reg_weight:.8g} "
+                f"soft_limit={opt.anisotropy_soft_limit:.8g}",
+                flush=True,
+            )
 
         loss.backward()
 
@@ -153,7 +170,12 @@ if __name__ == "__main__":
     pipeline = PipelineParams(parser)
     parser.add_argument("--iteration", default=10000, type=int, help="Number of training iterations (use more iterations for longer video sequences)")
     parser.add_argument("--prune_ratio", default=0.6, type=float, help="Ratio of gaussians to prune (default: 0.6)")
+    parser.add_argument("--seed", default=0, type=int, help="Deterministic conversion RNG seed")
     args = get_combined_args(parser)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
     print("Converting " + args.model_path)
 
     render_sets(model.extract(args), op.extract(args), args.iteration, pipeline.extract(args), args.prune_ratio)

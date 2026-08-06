@@ -143,6 +143,22 @@ class Camera(nn.Module):
             self.depth_map = torch.nn.functional.interpolate(self.depth_map.unsqueeze(0).unsqueeze(0), size=(self.image_height_final, self.image_width_final), mode='bilinear', align_corners=True).squeeze(0).squeeze(0)
 
     def update_RT(self, R, t):
+        # Validate shape
+        if not (isinstance(R, torch.Tensor) and R.shape == (3, 3)):
+            raise ValueError(f"R must be a (3, 3) tensor, got shape {getattr(R, 'shape', None)}")
+        if not (isinstance(t, torch.Tensor) and t.shape == (3,)):
+            raise ValueError(f"t must be a (3,) tensor, got shape {getattr(t, 'shape', None)}")
+        # Validate finiteness
+        if not (torch.isfinite(R).all() and torch.isfinite(t).all()):
+            raise ValueError("R and t must be finite")
+        # Validate SO(3): orthogonality and determinant
+        ortho_err = (R @ R.T - torch.eye(3, device=R.device, dtype=R.dtype)).abs().max().item()
+        det_err = abs(torch.det(R).item() - 1.0)
+        if ortho_err > 1e-3 or det_err > 1e-3:
+            raise ValueError(
+                f"R is not SO(3): max ortho error={ortho_err:.6f}, "
+                f"|det-1|={det_err:.6f}"
+            )
         self.R = R.to(device=self.data_device)
         self.T = t.to(device=self.data_device)
 

@@ -45,6 +45,9 @@ class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.eval = False
         self.load_pose = False
+        # Opt-in isolated route: use readCustomSceneInfo's COLMAP R_gt/T_gt,
+        # sparse points and intrinsics without MASt3R pose/depth initialization.
+        self.external_colmap_pose = False
         
         self.sh_degree = 3
         self.feat_dim = 32
@@ -54,6 +57,7 @@ class ModelParams(ParamGroup):
         self.update_init_factor = 16
         self.update_hierachy_factor = 4
         self.init_frame_num = 3
+        self.depth_source = "mast3r"
 
         self.use_feat_bank = False
         self._source_path = ""
@@ -139,6 +143,11 @@ class OptimizationParams(ParamGroup):
 
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+
+        # Conversion-only shape regularization. These remain explicit CLI
+        # parameters so reconversion sweeps are reproducible and recorded.
+        self.anisotropy_reg_weight = 0.01
+        self.anisotropy_soft_limit = 30.0
 
         self.loss_2d_correspondence_weight = 1.0
         self.depth_loss_weight = 0.1

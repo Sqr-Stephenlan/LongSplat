@@ -30,12 +30,16 @@ from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
 from utils.visualize_utils import vis_depth, vis_pose, eval_pose_metrics
 from utils.pose_utils import smooth_poses_spline, save_transforms, vis_loc
+from utils.nvs_pose_utils import (
+    build_adjacent_midpoint_slerp_pose_sequence,
+    build_nvs_pose_sequence,
+)
 from scene.cameras import Camera
 import cv2
 import imageio
 from utils.colmap_utils import save_imagestxt, save_cameras
 
-def render_nvs(model_path, name, iteration, views, gaussians, pipeline, background):
+def render_nvs(model_path, name, iteration, views, gaussians, pipeline, background, nvs_pose_mode="legacy_spline"):
     nvs_path = os.path.join(model_path, name, "ours_{}".format(iteration), "nvs")
     videos_path = os.path.join(model_path, name, "ours_{}".format(iteration), "videos")
     
@@ -44,16 +48,23 @@ def render_nvs(model_path, name, iteration, views, gaussians, pipeline, backgrou
     if not os.path.exists(videos_path):
         os.makedirs(videos_path)
 
-    poses_list = []
+    stored_world_view_list = []
     for view in views:
-        poses_list.append(view.view_world_transform.transpose(0, 1).detach().cpu().numpy())
-    poses_list = np.array(poses_list)
-    nvs_num = len(poses_list)
-
-    poses_list = np.array(poses_list)
-    nvs_pose_list = smooth_poses_spline(poses_list)
-    nvs_pose_list = torch.from_numpy(nvs_pose_list).cuda()
-    nvs_pose_list = nvs_pose_list.inverse()
+        stored_world_view_list.append(view.world_view_transform.detach().cpu().numpy())
+    stored_world_view_array = np.asarray(stored_world_view_list)
+    if nvs_pose_mode == "legacy_spline":
+        pose_result = build_nvs_pose_sequence(stored_world_view_array, smooth_poses_spline)
+    elif nvs_pose_mode == "adjacent_midpoint_slerp":
+        pose_result = build_adjacent_midpoint_slerp_pose_sequence(stored_world_view_array)
+    else:
+        raise ValueError(f"Unsupported nvs_pose_mode: {nvs_pose_mode}")
+    nvs_num = len(pose_result["smoothed_w2c"])
+    nvs_update_rotation = torch.from_numpy(
+        pose_result["update_rotation"].astype(np.float32)
+    ).cuda()
+    nvs_update_translation = torch.from_numpy(
+        pose_result["update_translation"].astype(np.float32)
+    ).cuda()
     FoVx = views[0].FoVx
     FoVy = views[0].FoVy
     nvs_image_list = []
@@ -61,10 +72,38 @@ def render_nvs(model_path, name, iteration, views, gaussians, pipeline, backgrou
     gt_list = []
     nvs_views = []
     name_list = []
+    with open(os.path.join(videos_path, "nvs_camera_poses.json"), "w") as pose_file:
+        json.dump(
+            {
+                "pose_mode": nvs_pose_mode,
+                "pose_convention": "stored_world_view_to_w2c_to_c2w_spline_or_adjacent_midpoint_slerp_to_w2c_update_RT",
+                "input_count": len(stored_world_view_array),
+                "nvs_count": nvs_num,
+                "poses": [
+                    {
+                        "index": i,
+                        "source_left_index": int(pose_result["source_left_index"][i]),
+                        "source_right_index": int(pose_result["source_right_index"][i]),
+                        "source_alpha": float(pose_result["source_alpha"][i]),
+                        "input_w2c": pose_result["input_w2c"][int(pose_result["source_left_index"][i])].tolist(),
+                        "input_c2w": pose_result["input_c2w"][int(pose_result["source_left_index"][i])].tolist(),
+                        "input_w2c_right": pose_result["input_w2c"][int(pose_result["source_right_index"][i])].tolist(),
+                        "input_c2w_right": pose_result["input_c2w"][int(pose_result["source_right_index"][i])].tolist(),
+                        "smoothed_c2w": pose_result["smoothed_c2w"][i].tolist(),
+                        "smoothed_w2c": pose_result["smoothed_w2c"][i].tolist(),
+                        "update_rotation": pose_result["update_rotation"][i].tolist(),
+                        "update_translation": pose_result["update_translation"][i].tolist(),
+                    }
+                    for i in range(nvs_num)
+                ],
+            },
+            pose_file,
+            indent=2,
+        )
     for i in tqdm(range(nvs_num), desc="Rendering NVS progress"):
         nvs_view = Camera(colmap_id=i, R=None, T=None, R_gt=None, T_gt=None, FoVx=FoVx, FoVy=FoVy, 
                          image=views[0].original_image, gt_alpha_mask=None, image_name=None, uid=None)
-        nvs_view.update_RT(nvs_pose_list[i, :3, :3].transpose(0, 1), nvs_pose_list[i, :3, 3])
+        nvs_view.update_RT(nvs_update_rotation[i], nvs_update_translation[i])
         nvs_view.to_final()
         rendering = render(nvs_view, gaussians, pipeline, background, retain_grad=False)
         voxel_visible_mask = rendering["visible_mask"]
@@ -186,7 +225,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         save_cameras(focals, principal_points, colmap_path, imgs_shape=image_shape)
         save_imagestxt(world2cam_np, colmap_path, name_list)        
 
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, nvs_pose_mode="legacy_spline"):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
@@ -202,7 +241,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
     if not skip_train:
         with torch.no_grad():
             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
-            render_nvs(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
+            render_nvs(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, nvs_pose_mode=nvs_pose_mode)
     if not skip_test:
         from utils.mast3r_utils import Mast3rMatcher
         matcher = Mast3rMatcher()
@@ -233,10 +272,11 @@ if __name__ == "__main__":
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--nvs_pose_mode", choices=["legacy_spline", "adjacent_midpoint_slerp"], default="legacy_spline")
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test)
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, nvs_pose_mode=args.nvs_pose_mode)

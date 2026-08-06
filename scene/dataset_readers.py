@@ -125,8 +125,11 @@ def readUnposedCameras(cam_extrinsics, cam_intrinsics, images_folder):
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
-        if intr.model=="SIMPLE_PINHOLE":
+        if intr.model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL"):
+            # SIMPLE_RADIAL stores [f, cx, cy, k].  Its single focal
+            # parameter is shared by x/y; params[1] is not fy.
             focal_length_x = intr.params[0]
+            focal_length_y = intr.params[0]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
         elif intr.model=="PINHOLE":
