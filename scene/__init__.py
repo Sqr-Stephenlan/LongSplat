@@ -168,7 +168,9 @@ class Scene:
             raise ValueError("external_colmap_pose requires --depth_source disabled")
         cameras = self.getAllCameras()
         expected_names = [f"frame_{index:06d}" for index in range(len(cameras))]
-        contract = external_camera_contract(
+        from utils.external_colmap_pose import retain_colmap_reference_transforms
+
+        reference = retain_colmap_reference_transforms(
             scene_info.train_cameras + scene_info.test_cameras,
             expected_names=expected_names,
         )
@@ -191,6 +193,11 @@ class Scene:
             camera.conf = None
             camera.is_registered = True
 
+        contract = external_camera_contract(
+            reference,
+            cameras,
+            expected_names=expected_names,
+        )
         self.init_frame_num = len(cameras)
         self.external_colmap_contract = {
             **contract,
