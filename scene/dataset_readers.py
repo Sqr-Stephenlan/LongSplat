@@ -14,6 +14,7 @@ from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View, focal2fov, fov2focal
+from utils.external_colmap_pose import order_camera_infos_by_contract
 import numpy as np
 import json
 from pathlib import Path
@@ -71,6 +72,16 @@ def getNerfppNorm(cam_info):
 ## TODO: Add support for reading images from a json file ##
 def readJsonCameras(cameras, cameras_gt, images_folder):
     cam_infos = []
+    gt_by_filename = {}
+    gt_by_stem = {}
+    if cameras_gt is not None:
+        for cam_gt in cameras_gt.values():
+            filename = os.path.basename(cam_gt.name)
+            stem = Path(filename).stem
+            if filename in gt_by_filename or stem in gt_by_stem:
+                raise ValueError(f"COLMAP camera names are ambiguous at {filename}")
+            gt_by_filename[filename] = cam_gt
+            gt_by_stem[stem] = cam_gt
     for idx, cam in enumerate(cameras):
         sys.stdout.write('\rReading camera {}/{}'.format(idx+1, len(cameras)))
         sys.stdout.flush()
@@ -78,31 +89,43 @@ def readJsonCameras(cameras, cameras_gt, images_folder):
         R_gt = None
         T_gt = None
         
-        # Only try to get GT poses if cameras_gt is available
-        if cameras_gt is not None:
-            for key in cameras_gt:
-                cam_gt = cameras_gt[key]
-                if cam["image_name"] == cam_gt.name.split(".")[0]:
-                    R_gt = np.transpose(qvec2rotmat(cam_gt.qvec))
-                    T_gt = np.array(cam_gt.tvec)
-                    break
+        declared_name = cam.get("image_name")
+        if not isinstance(declared_name, str) or not declared_name or Path(declared_name).name != declared_name:
+            raise ValueError(f"camera JSON image_name is not a safe basename: {declared_name!r}")
+        declared_path = Path(declared_name)
+        if declared_path.suffix:
+            files = [Path(images_folder) / declared_name]
+            internal_name = declared_path.stem
+            cam_gt = gt_by_filename.get(declared_name)
+        else:
+            files = sorted(
+                path for path in Path(images_folder).iterdir()
+                if path.is_file() and not path.is_symlink() and path.stem == declared_name
+            )
+            internal_name = declared_name
+            cam_gt = gt_by_stem.get(declared_name)
+        if len(files) != 1 or not files[0].is_file() or files[0].is_symlink():
+            raise FileNotFoundError(
+                f"camera JSON image_name must resolve to exactly one image: {declared_name}"
+            )
+        if cameras_gt is not None and cam_gt is None:
+            raise ValueError(f"camera JSON image_name has no exact COLMAP pose: {declared_name}")
+        if cam_gt is not None:
+            R_gt = np.transpose(qvec2rotmat(cam_gt.qvec))
+            T_gt = np.array(cam_gt.tvec)
         
         R = np.array(cam["R"])
         T = np.array(cam["T"])
         FovY = focal2fov(cam["Focaly"], cam["height"])
         FovX = focal2fov(cam["Focalx"], cam["width"])
 
-        pattern = os.path.join(images_folder, cam["image_name"] + ".*")
-        files = glob.glob(pattern)
-        if not files:
-            raise FileNotFoundError(f"Image file not found for {cam['image_name']}")
-        image_path = files[0]
+        image_path = str(files[0])
 
         image = Image.open(image_path)
 
         cam_info = CameraInfo(uid=idx, R=R, T=T, R_gt=R_gt, T_gt=T_gt,
                                FovY=FovY, FovX=FovX, image=image,
-                               image_path=image_path, image_name=cam["image_name"],
+                               image_path=image_path, image_name=internal_name,
                                width=image.size[0], height=image.size[1])
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
@@ -145,7 +168,10 @@ def readUnposedCameras(cam_extrinsics, cam_intrinsics, images_folder):
             FovX = focal2fov(focal_length_x, width)
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
-        image_name = os.path.basename(image_path).split(".")[0]
+        # The route-side identity contract records the explicit basename and
+        # maps it to this final-suffix stem.  ``split('.')`` is ambiguous for
+        # legal names such as ``room.v2.png`` and could alias two cameras.
+        image_name = Path(os.path.basename(image_path)).stem
         image = Image.open(image_path)
 
         cam_info = CameraInfo(uid=idx, R=None, T=None, R_gt=R, T_gt=T, FovY=FovY, FovX=FovX, image=image,
@@ -162,7 +188,7 @@ def readUnposedCameras2(images_folder):
         image_path = os.path.join(images_folder, image_name)
         image = Image.open(image_path)
         width, height = image.size
-        image_name = image_name.split(".")[0]
+        image_name = Path(image_name).stem
         cam_info = CameraInfo(uid=len(cam_infos), R=None, T=None, R_gt=None, T_gt=None, FovY=None, FovX=None, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height)
         cam_infos.append(cam_info)
@@ -545,7 +571,15 @@ def readCustomSceneInfo(path, images, eval, llffhold=8):
     else:
         cam_infos_unsorted = readUnposedCameras2(images_folder=os.path.join(path, reading_dir))
     
-    cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+    contract_path = Path(path) / "camera_contract-v1.json"
+    if contract_path.is_file() and not contract_path.is_symlink():
+        # COLMAP image IDs are not an ordering contract.  Preserve the
+        # immutable per-video contract order after exact name binding.
+        cam_infos = order_camera_infos_by_contract(
+            source_path=path, camera_infos=cam_infos_unsorted.copy()
+        )
+    else:
+        cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
@@ -595,11 +629,11 @@ def readCustomSceneInfo(path, images, eval, llffhold=8):
 
 import gzip
 from collections import defaultdict, OrderedDict
-from pytorch3d.renderer import PerspectiveCameras
-from pytorch3d.utils import opencv_from_cameras_projection
 import torch
 
 def load_camera(data, scale=1.0):
+    from pytorch3d.renderer import PerspectiveCameras
+    from pytorch3d.utils import opencv_from_cameras_projection
     """
     Load a camera from a CO3D annotation.
     """

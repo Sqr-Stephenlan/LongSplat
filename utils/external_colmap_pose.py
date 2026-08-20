@@ -7,10 +7,225 @@ contract can be checked before a CUDA process is started.
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+
+
+_IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+
+
+def _stable_sha256(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _safe_basename(value: object, *, label: str, validate_suffix: bool = True) -> str:
+    if not isinstance(value, str) or not value or value in {".", ".."}:
+        raise ValueError(f"{label} must be a non-empty basename")
+    if Path(value).name != value or "/" in value or "\\" in value or "\x00" in value:
+        raise ValueError(f"{label} must be a path-free basename: {value!r}")
+    if any(character.isspace() for character in value):
+        raise ValueError(f"{label} must not contain whitespace: {value!r}")
+    suffix = Path(value).suffix.lower()
+    if validate_suffix and suffix and suffix not in _IMAGE_SUFFIXES:
+        raise ValueError(f"{label} has unsupported image suffix: {value!r}")
+    return value
+
+
+def _filename_stem(value: str) -> str:
+    """Return the explicit final-suffix stem used by the input contract."""
+
+    return Path(value).stem if Path(value).suffix else value
+
+
+def _validate_unique_names(
+    names: Iterable[object], *, label: str, validate_suffix: bool = True
+) -> list[str]:
+    result = [_safe_basename(value, label=label, validate_suffix=validate_suffix) for value in names]
+    if len(result) != len(set(result)):
+        raise ValueError(f"{label} are not unique")
+    return result
+
+
+def _resolve_ordered_identity(
+    actual: list[str], filenames: list[str], stems: list[str], *, label: str
+) -> tuple[str, list[str]]:
+    if actual == filenames:
+        return "filename", list(filenames)
+    if actual == stems:
+        return "stem", list(stems)
+    if set(actual) == set(filenames) or set(actual) == set(stems):
+        raise ValueError(f"{label} order differs from the immutable camera contract")
+    raise ValueError(f"{label} set differs from the immutable camera contract")
+
+
+def _resolve_unordered_identity(
+    actual: list[str], filenames: list[str], stems: list[str], *, label: str
+) -> str:
+    if set(actual) == set(filenames):
+        return "filename"
+    if set(actual) == set(stems):
+        return "stem"
+    raise ValueError(f"{label} set differs from the immutable camera contract")
+
+
+def order_camera_infos_by_contract(
+    *, source_path: str | Path, camera_infos: list[object]
+) -> list[object]:
+    """Apply the recorded camera-contract order to name-bound camera objects.
+
+    COLMAP's numeric image IDs are not an input-order contract.  The adapter
+    therefore reorders already name-bound records by the immutable
+    ``camera_contract-v1.frame_names`` sequence, after requiring an exact
+    filename-or-final-suffix-stem set match.  It never sorts by a generated
+    numeric range or by an independently computed lexical order.
+    """
+
+    root = Path(source_path).resolve()
+    contract_path = root / "camera_contract-v1.json"
+    contract = _load_identity_json(contract_path, "camera contract")
+    if contract.get("schema_version") != "camera-contract-v1":
+        raise ValueError("camera contract schema is not camera-contract-v1")
+    value = contract.get("frame_names")
+    if not isinstance(value, list) or not value:
+        raise ValueError("camera contract frame_names are required")
+    filenames = _validate_unique_names(value, label="camera contract frame names")
+    stems = [_filename_stem(name) for name in filenames]
+    if len(stems) != len(set(stems)):
+        raise ValueError("camera contract has duplicate stems across image extensions")
+    actual = _validate_unique_names(
+        [getattr(camera, "image_name", None) for camera in camera_infos],
+        label="name-bound camera image names",
+        validate_suffix=False,
+    )
+    if set(actual) == set(stems):
+        lookup = dict(zip(actual, camera_infos))
+        return [lookup[stem] for stem in stems]
+    if set(actual) == set(filenames):
+        lookup = dict(zip(actual, camera_infos))
+        return [lookup[filename] for filename in filenames]
+    raise ValueError("name-bound camera set differs from the immutable camera contract")
+
+
+def _load_identity_json(path: Path, label: str) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} is missing or symlinked: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not valid JSON: {path}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object: {path}")
+    return value
+
+
+def load_external_camera_identity(
+    *,
+    source_path: str | Path,
+    camera_infos: list[object],
+    registered_colmap_names: list[str] | None = None,
+) -> dict[str, object]:
+    """Bind backend camera names to the immutable per-video input order.
+
+    The CPU input contract stores image basenames (usually with an extension),
+    while the nested backend's COLMAP reader exposes ``CameraInfo.image_name``
+    as a final-suffix stem.  This function records that boundary explicitly;
+    it never uses substring matching or a generated numeric range.
+    """
+
+    root = Path(source_path).resolve()
+    contract_path = root / "camera_contract-v1.json"
+    contract = _load_identity_json(contract_path, "camera contract")
+    if contract.get("schema_version") != "camera-contract-v1":
+        raise ValueError("camera contract schema is not camera-contract-v1")
+    contract_names_value = contract.get("frame_names")
+    if not isinstance(contract_names_value, list) or not contract_names_value:
+        raise ValueError("camera contract frame_names are required")
+    contract_names = _validate_unique_names(contract_names_value, label="camera contract frame names")
+    stems = [_filename_stem(name) for name in contract_names]
+    if len(stems) != len(set(stems)):
+        raise ValueError("camera contract has duplicate stems across image extensions")
+
+    manifest_path = root / "staging_manifest.json"
+    manifest = _load_identity_json(manifest_path, "staging manifest")
+    records = manifest.get("image_records")
+    if not isinstance(records, list) or not records:
+        raise ValueError("staging manifest image_records are required")
+    manifest_names = _validate_unique_names(
+        [record.get("name", record.get("staged_name")) for record in records if isinstance(record, dict)],
+        label="staging manifest image names",
+    )
+    if manifest_names != contract_names:
+        raise ValueError("staging manifest image order differs from camera contract")
+    declared_contract_sha = contract.get("contract_sha256")
+    if not isinstance(declared_contract_sha, str) or _stable_sha256({key: value for key, value in contract.items() if key != "contract_sha256"}) != declared_contract_sha:
+        raise ValueError("camera contract stable SHA failed")
+    if manifest.get("camera_contract_sha256") != declared_contract_sha:
+        raise ValueError("staging manifest camera contract binding failed")
+
+    static_path = root / "contract" / "static_contract.json"
+    if static_path.is_file() and not static_path.is_symlink():
+        static = _load_identity_json(static_path, "static contract")
+        if static.get("camera_contract_sha256") != declared_contract_sha:
+            raise ValueError("static contract camera contract binding failed")
+        if static.get("image_count") != len(contract_names) or static.get("image_names_verified") is not True:
+            raise ValueError("static contract camera identity summary failed")
+
+    if registered_colmap_names is None:
+        sparse = root / "sparse" / "0"
+        binary = sparse / "images.bin"
+        text = sparse / "images.txt"
+        if binary.is_file():
+            registered_colmap_names = parse_colmap_image_names_binary(binary)
+        elif text.is_file():
+            registered_colmap_names = parse_colmap_image_names_text(text)
+        else:
+            raise ValueError("COLMAP registered image model is missing")
+    registered = _validate_unique_names(
+        registered_colmap_names,
+        label="COLMAP registered image names",
+        validate_suffix=False,
+    )
+    registered_mode = _resolve_unordered_identity(
+        registered, contract_names, stems, label="COLMAP registered image names"
+    )
+
+    actual = _validate_unique_names(
+        [getattr(camera, "image_name", None) for camera in camera_infos],
+        label="active/reference camera image names",
+        validate_suffix=False,
+    )
+    if len(actual) != len(contract_names):
+        raise ValueError(
+            "active/reference camera count differs from immutable camera contract: "
+            f"{len(actual)} != {len(contract_names)}"
+        )
+    internal_mode, expected_internal = _resolve_ordered_identity(
+        actual, contract_names, stems, label="active/reference camera names"
+    )
+    return {
+        "schema_version": "external-camera-identity-v1",
+        "contract_path": str(contract_path),
+        "contract_file_sha256": hashlib.sha256(contract_path.read_bytes()).hexdigest(),
+        "contract_stable_sha256": declared_contract_sha,
+        "order_source": "camera-contract-v1.frame_names",
+        "contract_frame_names": contract_names,
+        "contract_frame_stems": stems,
+        "registered_colmap_names": registered,
+        "registered_colmap_name_mode": registered_mode,
+        "internal_camera_names": actual,
+        "internal_name_mode": internal_mode,
+        "expected_internal_names": expected_internal,
+        "basename_to_internal_name": dict(zip(contract_names, expected_internal)),
+        "camera_count": len(contract_names),
+        "exact_registered_set": True,
+        "order_verified": True,
+        "duplicate_stem_check": True,
+    }
 
 
 def qvec2rotmat(qvec: Iterable[float]) -> np.ndarray:

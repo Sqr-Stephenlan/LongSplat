@@ -15,10 +15,12 @@ from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos
 import torch
-from utils.mast3r_utils import Mast3rMatcher
 from scene.gaussian_model import BasicPointCloud
 from torch.nn import functional as F
-from utils.external_colmap_pose import external_camera_contract
+from utils.external_colmap_pose import (
+    external_camera_contract,
+    load_external_camera_identity,
+)
 
 class Scene:
 
@@ -91,6 +93,8 @@ class Scene:
                 return
 
             self.init_frame_num = args.init_frame_num
+            from utils.mast3r_utils import Mast3rMatcher
+
             matcher = Mast3rMatcher()
             source_path = os.path.join(args.source_path, args.images)
             camera_paths = [os.path.join(source_path, image_name) for image_name in os.listdir(source_path)]
@@ -163,15 +167,23 @@ class Scene:
         """Initialize one isolated fixed-pose COLMAP route; default is off."""
 
         if not getattr(args, "disable_resize", False):
-            raise ValueError("external_colmap_pose requires --disable_resize for the 1280x720 contract")
+            raise ValueError(
+                "external_colmap_pose requires --disable_resize for the "
+                "per-video centered-PINHOLE contract"
+            )
         if getattr(args, "depth_source", "disabled") != "disabled":
             raise ValueError("external_colmap_pose requires --depth_source disabled")
         cameras = self.getAllCameras()
-        expected_names = [f"frame_{index:06d}" for index in range(len(cameras))]
+        reference_infos = scene_info.train_cameras + scene_info.test_cameras
+        camera_identity = load_external_camera_identity(
+            source_path=args.source_path,
+            camera_infos=reference_infos,
+        )
+        expected_names = list(camera_identity["expected_internal_names"])
         from utils.external_colmap_pose import retain_colmap_reference_transforms
 
         reference = retain_colmap_reference_transforms(
-            scene_info.train_cameras + scene_info.test_cameras,
+            reference_infos,
             expected_names=expected_names,
         )
         if scene_info.point_cloud is None:
@@ -198,6 +210,7 @@ class Scene:
             cameras,
             expected_names=expected_names,
         )
+        contract["camera_identity"] = camera_identity
         self.init_frame_num = len(cameras)
         self.external_colmap_contract = {
             **contract,

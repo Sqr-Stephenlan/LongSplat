@@ -12,17 +12,38 @@ import os
 import numpy as np
 
 import subprocess
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
 
-os.system('echo $CUDA_VISIBLE_DEVICES')
+
+def _configure_cuda_visible_devices() -> None:
+    """Select the least-used GPU at the real training CLI boundary."""
+
+    result = subprocess.run(
+        ["nvidia-smi", "-q", "-d", "Memory"],
+        shell=False,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"nvidia-smi failed with exit {result.returncode}: {result.stderr.strip()[:500]}")
+    used: list[int] = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[0] == "Used" and fields[1] == ":":
+            try:
+                used.append(int(fields[2]))
+            except ValueError:
+                continue
+    if not used:
+        raise RuntimeError("nvidia-smi did not report GPU memory usage")
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(int(np.argmin(used)))
 
 
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, depth_loss
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -33,7 +54,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.pose_utils import save_transforms, update_pose
 from utils.graphics_utils import get_occlusion_mask, unporject, warping, compute_scale
-from utils.mast3r_utils import Mast3rMatcher
+from utils.camera_sampling_telemetry import CameraSamplingTelemetry
 import cv2
 from scipy.optimize import least_squares
 from torch.optim.lr_scheduler import ExponentialLR
@@ -126,6 +147,14 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
         "requested_translation_lr_init": float(opt.translation_lr_init),
         "iterations": iterations,
     })
+    sampling_telemetry = CameraSamplingTelemetry(
+        model_path=scene.model_path,
+        contract=contract,
+        cameras=cameras,
+        iterations=iterations,
+    )
+    anchor_adjust_iterations = []
+    anchor_adjust_events = []
     print(
         "EXTERNAL_POSE_TRAINING "
         + json.dumps(contract, sort_keys=True, allow_nan=False),
@@ -140,6 +169,7 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
         if not viewpoint_stack:
             viewpoint_stack = list(cameras)
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+        sampling_telemetry.record(iteration, viewpoint_cam)
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -185,13 +215,23 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
                     voxel_visible_mask,
                 )
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
-                    gaussians.adjust_anchor(
+                    anchor_stats = gaussians.adjust_anchor(
                         check_interval=opt.update_interval,
                         success_threshold=opt.success_threshold,
                         grad_threshold=opt.densify_grad_threshold,
                         min_opacity=opt.min_opacity,
                         require_purning=False,
                     )
+                    anchor_adjust_iterations.append(iteration)
+                    anchor_event = {
+                        "iteration": int(iteration),
+                        **(
+                            dict(anchor_stats)
+                            if isinstance(anchor_stats, dict)
+                            else {}
+                        ),
+                    }
+                    anchor_adjust_events.append(anchor_event)
             if iteration == opt.update_until:
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
@@ -207,6 +247,7 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
     scene.save(checkpoint_iteration)
     save_transforms(scene.getTrainCameras().copy(), os.path.join(scene.model_path, "cameras_all_train.json"))
     save_transforms(scene.getTestCameras().copy(), os.path.join(scene.model_path, "cameras_all_test.json"))
+    sampling_summary = sampling_telemetry.finalize(checkpoint_iteration=checkpoint_iteration)
     contract.update({
         "checkpoint_iteration": checkpoint_iteration,
         "checkpoint_ply": os.path.join(
@@ -216,6 +257,13 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
             "point_cloud.ply",
         ),
         "active_camera_json": os.path.join(scene.model_path, "cameras_all_train.json"),
+        "camera_sampling_telemetry": sampling_summary,
+        "anchor_schedule": {
+            "semantics": "LongSplat anchor_growing/adjust_anchor runtime events",
+            "observed_iterations": anchor_adjust_iterations,
+            "observed_events": anchor_adjust_events,
+            "observed_from_runtime": True,
+        },
     })
     contract_path = os.path.join(scene.model_path, "external_colmap_pose_contract.json")
     with open(contract_path, "w", encoding="utf-8") as handle:
@@ -247,6 +295,8 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
             gaussians,
             scene,
         )
+    from utils.mast3r_utils import Mast3rMatcher
+
     num_views = len(scene.getTrainCameras())
     start_view_id = 0
     end_view_id = 1
@@ -1000,6 +1050,12 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", type=str, default = '-1')
     args = parser.parse_args(sys.argv[1:])
 
+    _configure_cuda_visible_devices()
+
+    # Importing network_gui allocates its listener; keep that side effect at
+    # the real training CLI boundary rather than during module import.
+    from gaussian_renderer import network_gui
+
     
     # enable logging
     
@@ -1013,7 +1069,6 @@ if __name__ == "__main__":
 
     if args.gpu != '-1':
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
-        os.system("echo $CUDA_VISIBLE_DEVICES")
         logger.info(f'using GPU {args.gpu}')
         
     dataset = args.source_path.split('/')[-1]

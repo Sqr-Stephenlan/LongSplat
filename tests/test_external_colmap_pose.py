@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -11,6 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from utils.external_colmap_pose import (
     external_camera_contract,
+    load_external_camera_identity,
+    order_camera_infos_by_contract,
     retain_colmap_reference_transforms,
 )
 
@@ -88,3 +92,81 @@ def test_runtime_contract_rejects_invalid_active_pose(failure: str):
 
     with pytest.raises(ValueError):
         external_camera_contract(retained, active)
+
+
+def _identity_fixture(tmp_path: Path, names: list[str], actual_names: list[str] | None = None) -> tuple[Path, list[SimpleNamespace]]:
+    root = tmp_path / "training-input"
+    (root / "contract").mkdir(parents=True)
+    unsigned = {
+        "schema_version": "camera-contract-v1",
+        "frame_names": names,
+        "frame_count": len(names),
+        "camera": {"model": "PINHOLE", "width": 8, "height": 6},
+    }
+    contract = dict(unsigned)
+    contract["contract_sha256"] = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    (root / "camera_contract-v1.json").write_text(json.dumps(contract), encoding="utf-8")
+    (root / "staging_manifest.json").write_text(
+        json.dumps({
+            "image_records": [{"name": name} for name in names],
+            "camera_contract_sha256": contract["contract_sha256"],
+        }),
+        encoding="utf-8",
+    )
+    infos = [SimpleNamespace(image_name=name) for name in (actual_names or [Path(name).stem for name in names])]
+    return root, infos
+
+
+def test_camera_identity_accepts_noncontiguous_filename_contract_and_stem_backend(tmp_path: Path):
+    names = ["camera.alpha.png", "view-17.jpg", "x9.webp"]
+    root, infos = _identity_fixture(tmp_path, names)
+    identity = load_external_camera_identity(
+        source_path=root,
+        camera_infos=infos,
+        registered_colmap_names=names,
+    )
+    assert identity["internal_name_mode"] == "stem"
+    assert identity["registered_colmap_name_mode"] == "filename"
+    assert identity["expected_internal_names"] == ["camera.alpha", "view-17", "x9"]
+    assert identity["basename_to_internal_name"]["camera.alpha.png"] == "camera.alpha"
+
+
+def test_camera_order_adapter_uses_explicit_contract_not_colmap_numeric_order(tmp_path: Path):
+    names = ["camera.alpha.png", "view-17.jpg", "x9.webp"]
+    root, infos = _identity_fixture(tmp_path, names, ["x9", "camera.alpha", "view-17"])
+    ordered = order_camera_infos_by_contract(source_path=root, camera_infos=infos)
+    assert [info.image_name for info in ordered] == ["camera.alpha", "view-17", "x9"]
+
+
+def test_camera_identity_accepts_old_contiguous_stem_contract(tmp_path: Path):
+    names = [f"frame_{index:06d}" for index in range(4)]
+    root, infos = _identity_fixture(tmp_path, names)
+    identity = load_external_camera_identity(
+        source_path=root,
+        camera_infos=infos,
+        registered_colmap_names=names,
+    )
+    assert identity["internal_name_mode"] == "filename"
+    assert identity["expected_internal_names"] == names
+
+
+def test_camera_identity_rejects_duplicate_stem(tmp_path: Path):
+    root, infos = _identity_fixture(tmp_path, ["same.png", "same.jpg"], ["same", "same"])
+    with pytest.raises(ValueError, match="duplicate stems"):
+        load_external_camera_identity(source_path=root, camera_infos=infos, registered_colmap_names=["same.png", "same.jpg"])
+
+
+@pytest.mark.parametrize(
+    "actual,registered,pattern",
+    [
+        (["a"], ["a.png", "b.png"], "count"),
+        (["a", "b"], ["a.png", "c.png"], "set"),
+        (["b", "a"], ["a.png", "b.png"], "order"),
+    ],
+)
+def test_camera_identity_rejects_missing_extra_or_order_drift(tmp_path: Path, actual, registered, pattern: str):
+    root, infos = _identity_fixture(tmp_path, ["a.png", "b.png"], actual)
+    with pytest.raises(ValueError):
+        load_external_camera_identity(source_path=root, camera_infos=infos, registered_colmap_names=registered)

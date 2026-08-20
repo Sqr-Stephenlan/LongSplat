@@ -19,7 +19,22 @@ from scene.gaussian_model import BasicPointCloud
 from scene.dataset_readers import storePly
 from scene.colmap_loader import rotmat2qvec
 from utils.graphics_utils import focal2fov, fov2focal
-from dust3r.utils.device import to_numpy
+
+
+def _require_dust3r_to_numpy():
+    """Load the optional DUSt3R adapter only for legacy point-cloud helpers."""
+
+    try:
+        from dust3r.utils.device import to_numpy
+    except ModuleNotFoundError as exc:
+        if exc.name == "dust3r" or (exc.name and exc.name.startswith("dust3r.")):
+            raise ImportError(
+                "DUSt3R is an optional legacy dependency required by "
+                "utils.colmap_utils.get_pc and its point-cloud helpers; "
+                "external fixed-pose training/render does not use this path."
+            ) from exc
+        raise
+    return to_numpy
 
 
 def inv(mat):
@@ -156,6 +171,7 @@ end_header
             
 
 def get_pc(imgs, pts3d):
+    to_numpy = _require_dust3r_to_numpy()
     imgs = to_numpy(imgs)
     pts3d = to_numpy(pts3d)
     # mask = to_numpy(mask)

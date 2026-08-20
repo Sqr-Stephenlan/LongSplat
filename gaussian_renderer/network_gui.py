@@ -21,12 +21,14 @@ port = 6009
 conn = None
 addr = None
 
-listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener = None
 
 def init(wish_host, wish_port):
     global host, port, listener
     host = wish_host
     port = wish_port
+    if listener is None:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind((host, port))
     listener.listen()
     listener.settimeout(0)

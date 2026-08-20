@@ -12,11 +12,32 @@ import torch
 import numpy as np
 
 import subprocess
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
 
-os.system('echo $CUDA_VISIBLE_DEVICES')
+
+def _configure_cuda_visible_devices() -> None:
+    """Select the least-used GPU at the real render CLI boundary."""
+
+    result = subprocess.run(
+        ["nvidia-smi", "-q", "-d", "Memory"],
+        shell=False,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"nvidia-smi failed with exit {result.returncode}: {result.stderr.strip()[:500]}")
+    used: list[int] = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[0] == "Used" and fields[1] == ":":
+            try:
+                used.append(int(fields[2]))
+            except ValueError:
+                continue
+    if not used:
+        raise RuntimeError("nvidia-smi did not report GPU memory usage")
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(int(np.argmin(used)))
 
 from scene import Scene
 import json
@@ -274,6 +295,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--nvs_pose_mode", choices=["legacy_spline", "adjacent_midpoint_slerp"], default="legacy_spline")
     args = get_combined_args(parser)
+    _configure_cuda_visible_devices()
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)

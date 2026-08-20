@@ -976,6 +976,9 @@ class GaussianModel:
 
 
     def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005, require_purning=True):
+        before_anchor_count = int(self.get_anchor.shape[0])
+        added_anchor_count = 0
+        deleted_anchor_count = 0
         # # adding anchors
         grads = self.offset_gradient_accum / self.offset_denom  # [N*k, 1]
         grads[grads.isnan()] = 0.0
@@ -983,6 +986,8 @@ class GaussianModel:
         offset_mask = (self.offset_denom > check_interval * success_threshold * 0.5).squeeze(dim=1)
         
         self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+        after_growing_count = int(self.get_anchor.shape[0])
+        added_anchor_count = after_growing_count - before_anchor_count
 
         # update offset_denom
         self.offset_denom[offset_mask] = 0
@@ -1026,9 +1031,18 @@ class GaussianModel:
             self.anchor_demon = temp_anchor_demon
 
             if prune_mask.shape[0] > 0:
+                deleted_anchor_count = int(prune_mask.sum().item())
                 self.prune_anchor(prune_mask)
 
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        after_anchor_count = int(self.get_anchor.shape[0])
+        return {
+            "before_anchor_count": before_anchor_count,
+            "after_anchor_count": after_anchor_count,
+            "added_anchor_count": added_anchor_count,
+            "deleted_anchor_count": deleted_anchor_count,
+            "net_anchor_delta": after_anchor_count - before_anchor_count,
+        }
 
     
     
