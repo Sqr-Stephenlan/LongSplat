@@ -66,6 +66,10 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
+        # ``auto`` resolves to cpu-stream-v1 only for the canonical external
+        # fixed-pose/depth-disabled route.  Optional MASt3R/VDA paths retain
+        # the historical GPU image policy unless explicitly changed.
+        self.image_residency = "auto"
         self.eval = False
         self.lod = 0
 

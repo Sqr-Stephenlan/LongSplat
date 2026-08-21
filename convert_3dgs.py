@@ -128,7 +128,7 @@ def render_sets(dataset : ModelParams, opt : OptimizationParams, iteration : int
 
         image = render3dgs(viewpoint_cam, gaussians, pipe, background)["render"]
 
-        gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = viewpoint_cam.get_image(device="cuda")
         Ll1 = l1_loss(image, gt_image)
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
@@ -173,14 +173,19 @@ def render_sets(dataset : ModelParams, opt : OptimizationParams, iteration : int
                     psnr_test = 0.0
                     for view in scene.getTestCameras():
                         image = render3dgs(view, gaussians, pipe, background)["render"]
-                        gt_image = view.original_image.cuda()
+                        gt_image = view.get_image(device="cuda")
                         psnr_test += psnr(image, gt_image).mean().double()
                     psnr_test /= len(scene.getTestCameras())
                     print(f"Test PSNR: {psnr_test}")
-            
+
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+
+    scene.write_image_residency_telemetry(
+        "image_residency_conversion-v1.json",
+        phase="conversion",
+    )
 
 
 if __name__ == "__main__":

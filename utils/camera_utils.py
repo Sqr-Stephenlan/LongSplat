@@ -11,10 +11,15 @@ from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
+from utils.image_residency import (
+    ImageResidencyTelemetry,
+    resolve_image_residency,
+)
 
 WARNED = False
 
-def loadCam(args, id, cam_info, resolution_scale):
+def loadCam(args, id, cam_info, resolution_scale, *, image_residency=None,
+            residency_telemetry: ImageResidencyTelemetry | None = None):
     global WARNED
     orig_w, orig_h = cam_info.image.size
 
@@ -50,18 +55,37 @@ def loadCam(args, id, cam_info, resolution_scale):
     if resized_image_rgb.shape[1] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
 
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
+    if image_residency is None:
+        image_residency = resolve_image_residency(
+            getattr(args, "image_residency", "auto"),
+            external_colmap_pose=bool(getattr(args, "external_colmap_pose", False)),
+            depth_source=str(getattr(args, "depth_source", "mast3r")),
+        )
+
+    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                   R_gt=cam_info.R_gt, T_gt=cam_info.T_gt,
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
-                  disable_resize=args.disable_resize)
+                  disable_resize=args.disable_resize,
+                  image_residency=image_residency,
+                  residency_telemetry=residency_telemetry)
 
-def cameraList_from_camInfos(cam_infos, resolution_scale, args):
+def cameraList_from_camInfos(cam_infos, resolution_scale, args, *, image_residency=None,
+                             residency_telemetry: ImageResidencyTelemetry | None = None):
     camera_list = []
 
     for id, c in enumerate(cam_infos):
-        camera_list.append(loadCam(args, id, c, resolution_scale))
+        camera_list.append(
+            loadCam(
+                args,
+                id,
+                c,
+                resolution_scale,
+                image_residency=image_residency,
+                residency_telemetry=residency_telemetry,
+            )
+        )
 
     return camera_list
 

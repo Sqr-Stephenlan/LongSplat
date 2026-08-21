@@ -21,6 +21,10 @@ from utils.external_colmap_pose import (
     external_camera_contract,
     load_external_camera_identity,
 )
+from utils.image_residency import (
+    ImageResidencyTelemetry,
+    resolve_image_residency,
+)
 
 class Scene:
 
@@ -69,11 +73,34 @@ class Scene:
 
         self.gaussians.set_appearance(len(scene_info.train_cameras))
 
+        self.image_residency = resolve_image_residency(
+            getattr(args, "image_residency", "auto"),
+            external_colmap_pose=bool(getattr(args, "external_colmap_pose", False)),
+            depth_source=str(getattr(args, "depth_source", "mast3r")),
+        )
+        self.image_residency_telemetry = ImageResidencyTelemetry(
+            strategy=self.image_residency,
+            phase="scene",
+        )
+
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
-            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
+            self.train_cameras[resolution_scale] = cameraList_from_camInfos(
+                scene_info.train_cameras,
+                resolution_scale,
+                args,
+                image_residency=self.image_residency,
+                residency_telemetry=self.image_residency_telemetry,
+            )
             print("Loading Test Cameras")
-            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
+            self.test_cameras[resolution_scale] = cameraList_from_camInfos(
+                scene_info.test_cameras,
+                resolution_scale,
+                args,
+                image_residency=self.image_residency,
+                residency_telemetry=self.image_residency_telemetry,
+            )
+        self.image_residency_telemetry.bind(self.getAllCameras())
 
         if self.loaded_iter:
             self.gaussians.load_ply_sparse_gaussian(os.path.join(self.model_path,
@@ -129,11 +156,14 @@ class Scene:
                 if i == 0:
                     next_viewpoint_cam = self.getTrainCameras()[i + 1]
                     intrinsic_np = cur_viewpoint_cam.intrinsic.detach().cpu().numpy()
+                    cur_image = cur_viewpoint_cam.get_image(device="cuda")
+                    next_image = next_viewpoint_cam.get_image(device="cuda")
                     cur_viewpoint_cam.kp0, cur_viewpoint_cam.kp1, desc_conf1, desc_conf2, pts3d1, pts3d2, conf1, conf2, depth1, depth2 = matcher._forward(
-                        cur_viewpoint_cam.original_image,
-                        next_viewpoint_cam.original_image,
+                        cur_image,
+                        next_image,
                         intrinsic_np
                     )
+                    del cur_image, next_image
                     cur_viewpoint_cam.depth_map = torch.from_numpy(depth_maps[i]).float().cuda().detach()
                     cur_viewpoint_cam.depth_map = F.interpolate(cur_viewpoint_cam.depth_map.unsqueeze(0).unsqueeze(0), 
                                                                 size=(cur_viewpoint_cam.image_height, 
@@ -145,11 +175,14 @@ class Scene:
                     pre_viewpoint_cam = self.getTrainCameras()[i - 1]
                     
                     intrinsic_np = cur_viewpoint_cam.intrinsic.detach().cpu().numpy()
+                    pre_image = pre_viewpoint_cam.get_image(device="cuda")
+                    cur_image = cur_viewpoint_cam.get_image(device="cuda")
                     cur_viewpoint_cam.kp0, cur_viewpoint_cam.kp1, desc_conf1, desc_conf2, pts3d1, pts3d2, conf1, conf2, depth1, depth2 = matcher._forward(
-                        pre_viewpoint_cam.original_image, 
-                        cur_viewpoint_cam.original_image, 
+                        pre_image,
+                        cur_image,
                         intrinsic_np
                     )
+                    del pre_image, cur_image
                     cur_viewpoint_cam.conf = torch.ones(cur_viewpoint_cam.kp0.shape[0], device=cur_viewpoint_cam.kp0.device)
                     cur_viewpoint_cam.depth_map = torch.from_numpy(depth_maps[i]).float().cuda().detach()
                     cur_viewpoint_cam.depth_map = F.interpolate(cur_viewpoint_cam.depth_map.unsqueeze(0).unsqueeze(0), 
@@ -223,6 +256,7 @@ class Scene:
             "active_focal_x_px": float(cameras[0].Focalx),
             "active_focal_y_px": float(cameras[0].Focaly),
             "depth_source": "disabled",
+            "image_residency": self.image_residency_telemetry.snapshot(phase="scene"),
         }
         print(
             "EXTERNAL_POSE_CONTRACT "
@@ -247,3 +281,11 @@ class Scene:
     
     def getAllCameras(self, scale=1.0):
         return self.getTrainCameras(scale) + self.getTestCameras(scale)
+
+    def write_image_residency_telemetry(self, filename, *, phase=None):
+        """Write one append-only phase evidence file for the current Scene."""
+
+        return self.image_residency_telemetry.write(
+            os.path.join(self.model_path, filename),
+            phase=phase,
+        )

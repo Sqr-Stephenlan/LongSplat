@@ -184,7 +184,7 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
         scaling = render_pkg["scaling"]
         opacity = render_pkg["neural_opacity"]
 
-        gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = viewpoint_cam.get_image(device="cuda")
         Ll1 = l1_loss(image, gt_image)
         if FUSED_SSIM_AVAILABLE:
             ssim_loss = 1 - fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
@@ -247,6 +247,10 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
     scene.save(checkpoint_iteration)
     save_transforms(scene.getTrainCameras().copy(), os.path.join(scene.model_path, "cameras_all_train.json"))
     save_transforms(scene.getTestCameras().copy(), os.path.join(scene.model_path, "cameras_all_test.json"))
+    image_residency = scene.write_image_residency_telemetry(
+        "image_residency_training-v1.json",
+        phase="training",
+    )
     sampling_summary = sampling_telemetry.finalize(checkpoint_iteration=checkpoint_iteration)
     contract.update({
         "checkpoint_iteration": checkpoint_iteration,
@@ -258,6 +262,7 @@ def _training_external_colmap_pose(dataset, opt, pipe, dataset_name, debug_from,
         ),
         "active_camera_json": os.path.join(scene.model_path, "cameras_all_train.json"),
         "camera_sampling_telemetry": sampling_summary,
+        "image_residency": image_residency,
         "anchor_schedule": {
             "semantics": "LongSplat anchor_growing/adjust_anchor runtime events",
             "observed_iterations": anchor_adjust_iterations,
@@ -344,7 +349,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
         rendered_depth = render_pkg["depth"][0]
         voxel_visible_mask = render_pkg["visible_mask"]
 
-        gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = viewpoint_cam.get_image(device="cuda")
         Ll1 = l1_loss(image, gt_image)
 
         if FUSED_SSIM_AVAILABLE:
@@ -442,7 +447,10 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 pre_rendered_depth = pre_render_pkg["depth"][0]
 
                 intrinsic_np = viewpoint_cam.intrinsic.detach().cpu().numpy()
-                viewpoint_cam.kp0, viewpoint_cam.kp1, _, _, _, _, _, _, viewpoint_cam.pre_depth_map, viewpoint_cam.depth_map = matcher._forward(pre_viewpoint_cam1.original_image, viewpoint_cam.original_image, intrinsic_np)
+                pre_image = pre_viewpoint_cam1.get_image(device="cuda")
+                viewpoint_image = viewpoint_cam.get_image(device="cuda")
+                viewpoint_cam.kp0, viewpoint_cam.kp1, _, _, _, _, _, _, viewpoint_cam.pre_depth_map, viewpoint_cam.depth_map = matcher._forward(pre_image, viewpoint_image, intrinsic_np)
+                del pre_image, viewpoint_image
                 viewpoint_cam.conf = torch.ones(viewpoint_cam.kp0.shape[0], device=viewpoint_cam.kp0.device)
                 viewpoint_cam.kp0 = viewpoint_cam.kp0.cuda()
                 viewpoint_cam.kp1 = viewpoint_cam.kp1.cuda()
@@ -452,8 +460,9 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 pre_pts = unporject(pre_rendered_depth, pre_viewpoint_cam1.view_world_transform, pre_viewpoint_cam1.intrinsic, viewpoint_cam.kp0)
                 
                 kp1 = viewpoint_cam.kp1 / 2 + .5
-                kp1[:, 0] *= viewpoint_cam.original_image.shape[2]
-                kp1[:, 1] *= viewpoint_cam.original_image.shape[1]
+                image_shape = viewpoint_cam.image_shape()
+                kp1[:, 0] *= image_shape[2]
+                kp1[:, 1] *= image_shape[1]
                 pre_pts_np = pre_pts.detach().cpu().numpy()
                 kp1_np = kp1.detach().cpu().numpy()
 
@@ -495,7 +504,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 viewpoint_cam.depth_map = viewpoint_cam.depth_map * scale + offset
                 
             pose_optimizer = torch.optim.Adam([{"params": [viewpoint_cam.cam_trans_delta], "lr": opt.translation_lr_init}, {"params": [viewpoint_cam.cam_rot_delta], "lr": opt.rotation_lr_init}])
-            gt_image = viewpoint_cam.original_image.cuda()
+            gt_image = viewpoint_cam.get_image(device="cuda")
             
             progress_bar = tqdm(range(0, pose_iteration), desc="Pose estiamtion progress")
             for iteration in range(pose_iteration):
@@ -572,7 +581,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
             image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
             rendered_depth = render_pkg["depth"][0]
 
-            gt_image = viewpoint_cam.original_image.cuda()
+            gt_image = viewpoint_cam.get_image(device="cuda")
             Ll1 = l1_loss(image, gt_image)
 
             if FUSED_SSIM_AVAILABLE:
@@ -683,7 +692,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
             image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
             rendered_depth = render_pkg["depth"][0]
             
-            gt_image = viewpoint_cam.original_image.cuda()
+            gt_image = viewpoint_cam.get_image(device="cuda")
             Ll1 = l1_loss(image, gt_image)
 
             if FUSED_SSIM_AVAILABLE:
@@ -875,7 +884,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
         rendered_depth = render_pkg["depth"][0]
         
-        gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = viewpoint_cam.get_image(device="cuda")
         Ll1 = l1_loss(image, gt_image)
 
         if FUSED_SSIM_AVAILABLE:
@@ -953,6 +962,10 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
     scene.save(iteration)
     save_transforms(scene.getTrainCameras().copy(), os.path.join(scene.model_path, "cameras_all_train.json"))
     save_transforms(scene.getTestCameras().copy(), os.path.join(scene.model_path, "cameras_all_test.json"))
+    scene.write_image_residency_telemetry(
+        "image_residency_training-v1.json",
+        phase="training",
+    )
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -995,7 +1008,7 @@ def training_report(tb_writer, dataset_name, Ll1, loss, l1_loss, scene : Scene, 
                 render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
                 image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                 voxel_visible_mask = render_pkg["visible_mask"]
-                gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                gt_image = torch.clamp(viewpoint.get_image(device="cuda"), 0.0, 1.0)
                 if tb_writer and (idx < 30):
                     tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=end_view_id)
                     tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/errormap".format(viewpoint.image_name), (gt_image[None]-image[None]).abs(), global_step=end_view_id)

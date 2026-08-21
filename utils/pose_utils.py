@@ -186,8 +186,11 @@ def vis_loc(viewpoint, ref_viewpoint, gaussians, pipeline, background, matcher):
         intrinsic_np = viewpoint.intrinsic.detach().cpu().numpy()
         
         # Use mast3r for feature matching between reference and test images
+        ref_image = ref_viewpoint.get_image(device="cuda")
+        viewpoint_image = viewpoint.get_image(device="cuda")
         viewpoint.kp0, viewpoint.kp1, _, _, _, _, _, _, viewpoint.pre_depth_map, viewpoint.depth_map = matcher._forward(
-            ref_viewpoint.original_image, viewpoint.original_image, intrinsic_np)
+            ref_image, viewpoint_image, intrinsic_np)
+        del ref_image, viewpoint_image
         
         # Set confidence and move to GPU
         viewpoint.conf = torch.ones(viewpoint.kp0.shape[0], device=viewpoint.kp0.device)
@@ -201,8 +204,9 @@ def vis_loc(viewpoint, ref_viewpoint, gaussians, pipeline, background, matcher):
         
         # Convert keypoints to pixel coordinates
         kp1 = viewpoint.kp1 / 2 + .5
-        kp1[:, 0] *= viewpoint.original_image.shape[2]
-        kp1[:, 1] *= viewpoint.original_image.shape[1]
+        image_shape = viewpoint.image_shape()
+        kp1[:, 0] *= image_shape[2]
+        kp1[:, 1] *= image_shape[1]
         pre_pts_np = pre_pts.detach().cpu().numpy()
         kp1_np = kp1.detach().cpu().numpy()
         
@@ -258,7 +262,7 @@ def vis_loc(viewpoint, ref_viewpoint, gaussians, pipeline, background, matcher):
     ])
     # Use step decay for better fine-tuning
     scheduler = torch.optim.lr_scheduler.MultiStepLR(pose_optimizer, milestones=[400, 600], gamma=0.5)
-    gt_image = viewpoint.original_image.cuda()
+    gt_image = viewpoint.get_image(device="cuda")
 
     for iteration in range(pose_iteration):
         render_pkg = render(viewpoint, gaussians, pipeline, background, retain_grad=True)

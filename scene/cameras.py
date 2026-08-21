@@ -11,18 +11,26 @@ from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View, getProjectionMatrix
 from utils.graphics_utils import fov2focal, focal2fov
+from utils.image_residency import (
+    IMAGE_RESIDENCY_GPU_ALL_V0,
+    ImageResidencyTelemetry,
+)
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
-                 R_gt = None, T_gt = None, disable_resize=False):
+                 R_gt = None, T_gt = None, disable_resize=False,
+                 image_residency=IMAGE_RESIDENCY_GPU_ALL_V0,
+                 residency_telemetry: ImageResidencyTelemetry | None = None):
         super(Camera, self).__init__()
 
         self.uid = uid
         self.colmap_id = colmap_id
         self.image_name = image_name
         self.is_registered = False
+        self.image_residency = image_residency
+        self.residency_telemetry = residency_telemetry
 
         try:
             self.data_device = torch.device(data_device)
@@ -45,9 +53,14 @@ class Camera(nn.Module):
             self.R_pred = None
             self.T_pred = None
 
-        t = torch.eye(4, device=data_device)
+        t = torch.eye(4, device=self.data_device)
         self.R = t[:3, :3]
         self.T = t[:3, 3]
+
+        if image_residency == "cpu-stream-v1":
+            self.image_storage_device = torch.device("cpu")
+        else:
+            self.image_storage_device = self.data_device
 
         with torch.no_grad():
             max_side = max(image.shape[1], image.shape[2])
@@ -57,16 +70,24 @@ class Camera(nn.Module):
             else:
                 image_resize = image
 
-        self.original_image = image_resize.clamp(0.0, 1.0).to(self.data_device)
+        self._images_share_storage = bool(
+            disable_resize
+            and gt_alpha_mask is None
+            and tuple(image_resize.shape) == tuple(image.shape)
+        )
+        self.original_image = image_resize.clamp(0.0, 1.0).to(self.image_storage_device)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
 
-        self.original_image_final = image.clamp(0.0, 1.0).to(self.data_device)
+        if self._images_share_storage:
+            self.original_image_final = self.original_image
+        else:
+            self.original_image_final = image.clamp(0.0, 1.0).to(self.image_storage_device)
         self.image_width_final = self.original_image_final.shape[2]
         self.image_height_final = self.original_image_final.shape[1]
 
         if gt_alpha_mask is not None:
-            self.original_image *= gt_alpha_mask.to(self.data_device)
+            self.original_image = self.original_image * gt_alpha_mask.to(self.image_storage_device)
         
         self.zfar = 100.0
         self.znear = 0.01
@@ -119,6 +140,54 @@ class Camera(nn.Module):
         return self.world_view_transform.inverse()[3, :3]
 
     @property
+    def images_share_storage(self):
+        return self._images_share_storage
+
+    def resident_image_tensors(self):
+        """Return image tensors retained by this Camera, without transferring."""
+
+        return (self.original_image, self.original_image_final)
+
+    def image_shape(self, stage="optimization"):
+        """Return CHW image shape without materializing a device copy."""
+
+        if stage not in ("optimization", "final"):
+            raise ValueError(f"unknown image stage: {stage!r}")
+        image = self.original_image if stage == "optimization" else self.original_image_final
+        return tuple(int(value) for value in image.shape)
+
+    def get_image(self, stage="optimization", device=None, non_blocking=False):
+        """Get one GT image, optionally transferring only the caller's copy.
+
+        The Camera never caches a transfer.  In ``cpu-stream-v1`` the camera
+        list therefore retains CPU tensors only; the returned CUDA tensor is
+        bounded by the caller's current operation.
+        """
+
+        if stage not in ("optimization", "final"):
+            raise ValueError(f"unknown image stage: {stage!r}")
+        image = self.original_image if stage == "optimization" else self.original_image_final
+        target = self.image_storage_device if device is None else torch.device(device)
+        same_type = image.device.type == target.type
+        same_index = target.index is None or image.device.index == target.index
+        if same_type and same_index:
+            return image
+        try:
+            transferred = image.to(device=target, non_blocking=non_blocking)
+        except Exception:
+            if self.residency_telemetry is not None:
+                self.residency_telemetry.record_device_error()
+            raise
+        if self.residency_telemetry is not None:
+            self.residency_telemetry.record_transfer(
+                camera=self,
+                image=transferred,
+                stage=stage,
+                target=target,
+            )
+        return transferred
+
+    @property
     def tanfovx(self):
         if self._tanfovx is None:
             import math
@@ -136,9 +205,10 @@ class Camera(nn.Module):
         self.original_image = self.original_image_final
         self.image_width = self.image_width_final
         self.image_height = self.image_height_final
-        self.Focalx = fov2focal(self.FoVx, self.image_width_final)
-        self.Focaly = fov2focal(self.FoVy, self.image_height_final)
-        self.intrinsic = torch.tensor([[self.Focalx, 0, self.image_width_final / 2], [0, self.Focaly, self.image_height_final / 2], [0, 0, 1]]).cuda()
+        if self.FoVx is not None and self.FoVy is not None:
+            self.Focalx = fov2focal(self.FoVx, self.image_width_final)
+            self.Focaly = fov2focal(self.FoVy, self.image_height_final)
+            self.intrinsic = torch.tensor([[self.Focalx, 0, self.image_width_final / 2], [0, self.Focaly, self.image_height_final / 2], [0, 0, 1]]).cuda()
         if self.depth_map is not None:
             self.depth_map = torch.nn.functional.interpolate(self.depth_map.unsqueeze(0).unsqueeze(0), size=(self.image_height_final, self.image_width_final), mode='bilinear', align_corners=True).squeeze(0).squeeze(0)
 
@@ -182,6 +252,24 @@ class MiniCam:
         self.zfar = zfar
         self.world_view_transform = world_view_transform
         self.full_proj_transform = full_proj_transform
+        self.projection_matrix = None
+        self.cam_rot_delta = None
+        self.cam_trans_delta = None
+        self._tanfovx = None
+        self._tanfovy = None
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
 
+    @property
+    def tanfovx(self):
+        if self._tanfovx is None:
+            import math
+            self._tanfovx = math.tan(self.FoVx * 0.5)
+        return self._tanfovx
+
+    @property
+    def tanfovy(self):
+        if self._tanfovy is None:
+            import math
+            self._tanfovy = math.tan(self.FoVy * 0.5)
+        return self._tanfovy

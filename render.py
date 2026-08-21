@@ -55,10 +55,11 @@ from utils.nvs_pose_utils import (
     build_adjacent_midpoint_slerp_pose_sequence,
     build_nvs_pose_sequence,
 )
-from scene.cameras import Camera
+from scene.cameras import MiniCam
 import cv2
 import imageio
 from utils.colmap_utils import save_imagestxt, save_cameras
+from utils.graphics_utils import getProjectionMatrix, getWorld2View
 
 def render_nvs(model_path, name, iteration, views, gaussians, pipeline, background, nvs_pose_mode="legacy_spline"):
     nvs_path = os.path.join(model_path, name, "ours_{}".format(iteration), "nvs")
@@ -90,9 +91,16 @@ def render_nvs(model_path, name, iteration, views, gaussians, pipeline, backgrou
     FoVy = views[0].FoVy
     nvs_image_list = []
     nvs_depth_list = []
-    gt_list = []
-    nvs_views = []
     name_list = []
+    gt_source = views[0].get_image(stage="final", device="cpu")[0:3, :, :]
+    gt_source = (gt_source.permute(1, 2, 0).detach().cpu().numpy() * 255.).astype(np.uint8)[..., ::-1]
+    gt_source = cv2.cvtColor(gt_source, cv2.COLOR_RGB2BGR)
+    gt_writer = imageio.get_writer(
+        os.path.join(videos_path, 'gt.mp4'),
+        fps=30,
+        quality=6,
+        output_params=["-f", "mp4"],
+    )
     with open(os.path.join(videos_path, "nvs_camera_poses.json"), "w") as pose_file:
         json.dump(
             {
@@ -121,28 +129,52 @@ def render_nvs(model_path, name, iteration, views, gaussians, pipeline, backgrou
             pose_file,
             indent=2,
         )
-    for i in tqdm(range(nvs_num), desc="Rendering NVS progress"):
-        nvs_view = Camera(colmap_id=i, R=None, T=None, R_gt=None, T_gt=None, FoVx=FoVx, FoVy=FoVy, 
-                         image=views[0].original_image, gt_alpha_mask=None, image_name=None, uid=None)
-        nvs_view.update_RT(nvs_update_rotation[i], nvs_update_translation[i])
-        nvs_view.to_final()
-        rendering = render(nvs_view, gaussians, pipeline, background, retain_grad=False)
-        voxel_visible_mask = rendering["visible_mask"]
-        torchvision.utils.save_image(rendering["render"], os.path.join(nvs_path, '{0:05d}'.format(i) + ".png"))
-        render_img = torch.clamp(rendering["render"], min=0., max=1.)
-        render_img = (render_img.permute(1, 2, 0).detach().cpu().numpy() * 255.).astype(np.uint8)[..., ::-1]
-        gt = nvs_view.original_image[0:3, :, :]
-        gt = (gt.permute(1, 2, 0).detach().cpu().numpy() * 255.).astype(np.uint8)[..., ::-1]
-        gt = cv2.cvtColor(gt, cv2.COLOR_RGB2BGR)
-        gt_list.append(gt)
-        depth_map = vis_depth(rendering['depth'][0].detach().cpu().numpy())
-        depth_map = cv2.cvtColor(depth_map, cv2.COLOR_RGB2BGR)
-        nvs_depth_list.append(depth_map)
-        render_img = cv2.cvtColor(render_img, cv2.COLOR_RGB2BGR)
-        nvs_image_list.append(render_img)
-        nvs_views.append(nvs_view)
-        name_list.append('{0:05d}'.format(i))
-    imageio.mimwrite(os.path.join(videos_path, 'gt.mp4'), np.stack(gt_list), fps=30, quality=6, output_params=["-f", "mp4"])
+    try:
+        for i in tqdm(range(nvs_num), desc="Rendering NVS progress"):
+            world_view_transform = getWorld2View(
+                nvs_update_rotation[i], nvs_update_translation[i]
+            ).transpose(0, 1)
+            projection_matrix = getProjectionMatrix(
+                znear=views[0].znear,
+                zfar=views[0].zfar,
+                fovX=FoVx,
+                fovY=FoVy,
+            ).transpose(0, 1).to(world_view_transform.device)
+            full_proj_transform = (
+                world_view_transform.unsqueeze(0)
+                .bmm(projection_matrix.unsqueeze(0))
+                .squeeze(0)
+            )
+            nvs_view = MiniCam(
+                width=views[0].image_width,
+                height=views[0].image_height,
+                fovy=FoVy,
+                fovx=FoVx,
+                znear=views[0].znear,
+                zfar=views[0].zfar,
+                world_view_transform=world_view_transform,
+                full_proj_transform=full_proj_transform,
+            )
+            nvs_view.projection_matrix = projection_matrix
+            nvs_view.cam_rot_delta = torch.zeros(3, device=world_view_transform.device)
+            nvs_view.cam_trans_delta = torch.zeros(3, device=world_view_transform.device)
+            rendering = render(nvs_view, gaussians, pipeline, background, retain_grad=False)
+            voxel_visible_mask = rendering["visible_mask"]
+            torchvision.utils.save_image(rendering["render"], os.path.join(nvs_path, '{0:05d}'.format(i) + ".png"))
+            render_img = torch.clamp(rendering["render"], min=0., max=1.)
+            render_img = (render_img.permute(1, 2, 0).detach().cpu().numpy() * 255.).astype(np.uint8)[..., ::-1]
+            # Keep only one full-resolution GT frame in memory; the writer
+            # consumes it immediately instead of retaining 2N-1 copies.
+            gt_writer.append_data(gt_source)
+            depth_map = vis_depth(rendering['depth'][0].detach().cpu().numpy())
+            depth_map = cv2.cvtColor(depth_map, cv2.COLOR_RGB2BGR)
+            nvs_depth_list.append(depth_map)
+            render_img = cv2.cvtColor(render_img, cv2.COLOR_RGB2BGR)
+            nvs_image_list.append(render_img)
+            name_list.append('{0:05d}'.format(i))
+            del nvs_view, rendering, render_img, depth_map
+    finally:
+        gt_writer.close()
     imageio.mimwrite(os.path.join(videos_path, 'nvs_rgb.mp4'), np.stack(nvs_image_list), fps=30, quality=6, output_params=["-f", "mp4"])
     imageio.mimwrite(os.path.join(videos_path, 'nvs_depth.mp4'), np.stack(nvs_depth_list), fps=30, quality=6, output_params=["-f", "mp4"])
 
@@ -184,7 +216,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         t_list.append(t1-t0)
 
         poses_list.append(view.view_world_transform.transpose(0, 1).detach().cpu().numpy())
-        gt = view.original_image[0:3, :, :]
+        gt = view.get_image(stage="final", device="cpu")[0:3, :, :]
         name_list.append('{0:05d}'.format(idx))
 
         torchvision.utils.save_image(rendering["render"], os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
@@ -234,7 +266,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         focals = np.array(focals)[..., None]
         principal_points = [views[0].intrinsic[:2, 2].detach().cpu().numpy()] * len(views)
         principal_points = np.array(principal_points)
-        image_shape = views[0].original_image.shape
+        image_shape = views[0].image_shape("final")
         world2cam_np = []
         for cam in views:
             Rt = np.eye(4)
@@ -283,6 +315,11 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             save_transforms(scene.getTestCameras().copy(), os.path.join(scene.model_path, "cameras_all_test.json"))
         with torch.no_grad():
             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
+
+    scene.write_image_residency_telemetry(
+        "image_residency_render-v1.json",
+        phase="render",
+    )
 
 if __name__ == "__main__":
     # Set up command line argument parser
